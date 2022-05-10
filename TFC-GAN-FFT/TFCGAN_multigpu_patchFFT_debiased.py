@@ -6,7 +6,6 @@ import itertools
 import time
 import datetime
 import sys
-import torchvision
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
 from torch.utils.data import DataLoader, DistributedSampler
@@ -45,19 +44,12 @@ parser.add_argument("--out_file", type=str, default="out", help="name of output 
 parser.add_argument("--experiment", type=str, default="none", help="experiment name")
 parser.add_argument("--annots_csv", type=str, default="none", help="csv file path for train labels")
 parser.add_argument("--test_annots_csv", type=str, default="none", help="csv file path for test labels")
-parser.add_argument("--num_ethn", type=int, default=4, help="num ethnicity classes")
 opt = parser.parse_args()
 
 """
-V4:
-
-> fft-patch loss
-> lpips loss
-> ethn-regional loss
-> with separate CNN for ethnicity regional classification
-> relativistic-adv loss
-> label loss (global)
-
+Experiment: Adds Fourier GAN Loss
+Experimental debiased version where I pass labels to the generator.
+Discriminator outputs auxiliary classifiers for each gender, age, ethnicity label.
 
 """
 
@@ -77,25 +69,25 @@ torch.manual_seed(42)
 # Adversarial
 criterion_GAN = torch.nn.BCEWithLogitsLoss()
 
-# Label Loss - Global
+# Label Loss
 criterion_label = torch.nn.CrossEntropyLoss()
-
-# Ethnicity loss - Regional
-criterion_ethn = torch.nn.CrossEntropyLoss()
 
 # LPIPS
 criterion_lpips = LPIPS(
     net_type='vgg',  # choose a network type from ['alex', 'squeeze', 'vgg']
     version='0.1'  # Currently, v0.1 is supported
 )
-# FFT Patch Triplet Loss
-criterion_amp = nn.TripletMarginLoss(margin=1.0, p=2)
-criterion_phase = nn.TripletMarginLoss(margin=1.0, p=2)
+# Patch Triplet Loss
+triplet_loss = nn.TripletMarginLoss(margin=1.0, p=2)
 # scaling param for temp loss since value will be very small
 lambda_t = 10
 
 # Temp Triplet Loss
 criterion_temp = nn.TripletMarginLoss(margin=1.0, p=2)
+
+# Fourier Amplitude and Phase Losses
+criterion_amp = nn.L1Loss()
+criterion_phase = nn.L1Loss()
 
 ################
 # Discr. Patches
@@ -231,9 +223,9 @@ class Discriminator1(nn.Module):
         with autocast():
             img_input = torch.cat((img_A, img_B), 1)
             output = self.model(img_input).type(HalfTensor)
-            
             # Label Prediction 
             out = img_input.view(img_input.shape[0], -1) # flatten image to 2D
+            
             gender_hat = self.aux_gender(out)
             ethn_hat = self.aux_ethn(out)
             age_hat = self.aux_age(out)
@@ -241,28 +233,6 @@ class Discriminator1(nn.Module):
         return output, gender_hat, ethn_hat, age_hat
 
 
-#############################
-#      Ethnicity Classifier
-#############################
-
-class CNN(nn.Module):
-    def __init__(self):
-        super(CNN, self).__init__()
-        self.model = torchvision.models.resnet18(pretrained=True) #Resnet18 a smaller model
-        
-        for param in self.model.parameters():
-                param.requires_grad = False
-        #set_parameter_requires_grad(self.model, feature_extract='True') # freeze base layers 
-        
-        num_ftrs = self.model.fc.in_features
-        
-        self.model.fc = nn.Sequential(nn.Dropout(0.3), 
-                                      nn.Linear(num_ftrs, opt.num_ethn)) #num_ethn = 4 (White, Asian, B, NW)
-    def forward(self, x):
-        x = self.model(x)
-        return x
-    
-    
 ##############################
 #       Utils
 ##############################
@@ -275,8 +245,7 @@ def weights_init_normal(m):
         torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
         torch.nn.init.constant_(m.bias.data, 0.0)
 
-        
-##############
+
 def label_formatter(labels):
     # for the real labels, not the predictions
     if opt.batch_size > 1:
@@ -287,17 +256,11 @@ def label_formatter(labels):
         labels = labels.type(torch.LongTensor)
         labels = labels.squeeze_(dim=0) # batch size must be torch.size[1] by 0 dim
         labels = labels.to(device='cuda')
+        
+    #print("label formatter returns a label size of:", labels.size())
     return labels
- 
     
-##############    
-def regional_features(fake_B):
-    hair = fake_B[:, :, 0:100, 0:0+opt.img_width] # torch.Size([batch, 3, 100, 256])
-    eyes = fake_B[:, :, 100:opt.img_width-56, 0:0+opt.img_width] # torch.Size([batch, 3, 100, 256])
-    return hair, eyes
-
-
-##############        
+        
 # for passing to vectorizer for fake_B temperature calculation
 T = np.linspace(24, 38, num=256) # 0 - 255 indices of temperatures in Celsius
 d = dict(enumerate((T).flatten(), 0)) # dictionary like {0: 24.0, 1: 24.054901960784314, etc.}
@@ -312,8 +275,7 @@ def vectorize_temps(fake_B):
     TFB_tensor = torch.cat(TFB).reshape(opt.batch_size, 1, opt.img_height, opt.img_width)     
     return TFB_tensor
 
-
-##############      
+      
 class FFT_Components(object):
 
     def __init__(self, image):
@@ -333,9 +295,9 @@ class FFT_Components(object):
         fshift = np.fft.fftshift(f_result)
         magnitude_spectrum = np.log(np.abs(fshift)) 
         return magnitude_spectrum
-
+        
     
-##############            
+    
 def fft_components(thermal_tensor, patch=True):
     # thermal_tensor can be fake_B or real_B
     #print("thermal tensor shape:", thermal_tensor.size())
@@ -364,7 +326,6 @@ def fft_components(thermal_tensor, patch=True):
     return AMP_tensor, PHA_tensor
     
     
-##############    
 def sample_spectra(thermal_tensor):
     SPEC =[]
     for t in range(0, thermal_tensor.size(0)): 
@@ -375,68 +336,10 @@ def sample_spectra(thermal_tensor):
             SPEC.append(spectra)
             
     SPEC_tensor = torch.cat(SPEC).reshape(thermal_tensor.size(0), 1, opt.img_height, opt.img_width)    
+    
     return SPEC_tensor
     
     
-##############    
-def triplet_fft(fake_B, B1, B2, B3, B4):
-    """ to do on k=16, have to modify this fxn"""
-    # triplet loss on the patches of fake_B
-    fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
-    fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
-    fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
-    fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
-
-    #>>Fourier Transform Loss for Each Patch
-    A1f, P1f = fft_components(fake_B1) 
-    A2f, P2f = fft_components(fake_B2)
-    A3f, P3f = fft_components(fake_B3)
-    A4f, P4f = fft_components(fake_B4)
-
-    A1r, P1r = fft_components(B1)
-    A2r, P2r = fft_components(B2)
-    A3r, P3r = fft_components(B3)
-    A4r, P4r = fft_components(B4)
-
-    # Here I randomize the negatives
-    random_patches = torch.stack([B1, B2, B3, B4])
-    patch_num = 4
-    K1 = random_patches[np.random.randint(patch_num, size=1).item()]
-    K2 = random_patches[np.random.randint(patch_num, size=1).item()]
-    K3 = random_patches[np.random.randint(patch_num, size=1).item()]
-    K4 = random_patches[np.random.randint(patch_num, size=1).item()]
-
-    A1K, P1K = fft_components(K1)
-    A2K, P2K = fft_components(K2)
-    A3K, P3K = fft_components(K3)
-    A4K, P4K = fft_components(K4)
-
-    B1_trip_amp = criterion_amp(A1f,A1r,A1K)
-    B2_trip_amp = criterion_amp(A2f,A2r,A2K)
-    B3_trip_amp = criterion_amp(A3f,A3r,A3K)
-    B4_trip_amp = criterion_amp(A4f,A4r,A4K)
-    Amp_loss = 1/4*(B1_trip_amp + B2_trip_amp + B3_trip_amp + B4_trip_amp)
-
-    B1_trip_pha = criterion_amp(P1f,P1r,P1K)
-    B2_trip_pha = criterion_amp(P2f,P2r,P2K)
-    B3_trip_pha = criterion_amp(P3f,P3r,P3K)
-    B4_trip_pha = criterion_amp(P4f,P4r,P4K)
-    Pha_loss = 1/4*(B1_trip_pha + B2_trip_pha + B3_trip_pha + B4_trip_pha)
-
-    return Amp_loss, Pha_loss
-    
-    
-##############
-def regional_ethn_classifier(fake_B, ethn):
-    fb_hair, fb_eyes = regional_features(fake_B)
-    hair_pred = CNN_hair(fb_hair)
-    eyes_pred = CNN_eyes(fb_eyes)
-
-    reg_ethn_loss = criterion_ethn(hair_pred, ethn) + criterion_ethn(eyes_pred, ethn)
-    return reg_ethn_loss
-    
-    
-##############    
 def sample_images(batches_done):
     imgs = next(iter(test_dataloader))
     real_A = Variable(imgs["A"].type(HalfTensor))
@@ -465,17 +368,7 @@ def sample_images(batches_done):
     save_image(img_sample_global, "images/%s/%s_g.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
     
     
-###############
-def print_network(model, name):
-    """Print out the network information."""
-    num_params = 0
-    for p in model.parameters():
-        num_params += p.numel()
-    print(model)
-    print(name)
-    print("The number of parameters: {}".format(num_params))
-    
-    
+
 ##############################
 #       Initialize
 ##############################
@@ -485,28 +378,24 @@ input_shape_global = (opt.channels, opt.img_height, opt.img_width)
 
 generator = GeneratorUNet(input_shape_global)
 discriminator1 = Discriminator1(input_shape_global)
-CNN_hair = CNN()
-CNN_eyes = CNN()
 
 generator = generator.cuda()
 discriminator1 = discriminator1.cuda()
-CNN_hair = CNN_hair.cuda() # ethnicity classifier based on hair
-CNN_eyes = CNN_eyes.cuda() # ethnicity classifier based on eyes, both are ResNet18
 
-criterion_GAN.cuda() #Adversarial Loss
-criterion_label.cuda() #Global Label Loss
-criterion_ethn.cuda() #Regional Eyes/Hair Ethnicity Loss
-criterion_lpips.cuda() #Global LPIPS Loss
-criterion_temp.cuda() #Global Temp Loss
-criterion_amp.cuda() #Triplet FFT Amplitude Loss
-criterion_phase.cuda() #Triplet FFT Phase Loss
+criterion_GAN.cuda()
+criterion_label.cuda()
+criterion_lpips.cuda()
+triplet_loss.cuda()
+criterion_temp.cuda()
+criterion_amp.cuda()
+criterion_phase.cuda()
 
 ################    
 # nn.DataParallel
 ################
 
-generator = torch.nn.DataParallel(generator, device_ids=[1,2])
-discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[1,2])
+generator = torch.nn.DataParallel(generator, device_ids=[0,1,2])
+discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[0,1,2])
 
 if opt.epoch != 0:
     # Load pretrained models /home/local/AD/cordun1/experiments/faPVTgan/saved_models/0209_devcom_TripTemp
@@ -522,15 +411,18 @@ else:
 ################    
 # Optimizers
 ################
-
-# jointly optimize the CNNs and Generator
-
-optimizer_G = torch.optim.Adam(
-    itertools.chain(generator.parameters(), CNN_hair.parameters(), CNN_eyes.parameters()), lr=opt.lr, betas=(opt.b1, opt.b2)
-)
-
+optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 optimizer_D = torch.optim.Adam(discriminator1.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 
+
+def print_network(model, name):
+    """Print out the network information."""
+    num_params = 0
+    for p in model.parameters():
+        num_params += p.numel()
+    print(model)
+    print(name)
+    print("The number of parameters: {}".format(num_params))
 
 ##############################
 # Transforms and Dataloaders
@@ -567,7 +459,6 @@ test_dataloader = DataLoader(
 HalfTensor = torch.cuda.HalfTensor if cuda else torch.HalfTensor
 LongTensor = torch.cuda.LongTensor if cuda else torch.LongTensor # for labels
 
-
 ##############################
 #       Training
 ##############################
@@ -594,26 +485,27 @@ for epoch in range(opt.epoch, opt.n_epochs):
         valid_ones = Variable(HalfTensor(np.ones((real_A.size(0), *patch_for_g))), requires_grad=False)
         valid = valid_ones.fill_(0.9)
         fake = Variable(HalfTensor(np.zeros((real_A.size(0), *patch_for_g))), requires_grad=False)
-        
-        # format as Long for CE loss
-        gender = label_formatter(labels[:, 0])
-        ethn = label_formatter(labels[:, 1])
-        age = label_formatter(labels[:, 2])
 
         # ------------------
-        #  Train Generator
+        #  Train Generators
         # ------------------
+        """
+        I know in favtgan, I passed fake labels as noise; 
+        this time I'm going to pass the real labels and see what happens G(A, labels)
+        https://github.com/eriklindernoren/PyTorch-GAN/blob/master/implementations/acgan/acgan.py
+        """
 
         print("+ + + optimizer_G.zero_grad() + + +")
         optimizer_G.zero_grad()
 
         with autocast(): 
-        
-           # Give G the real label
-            fake_B = generator(real_A, labels) # needs to go in as floats to the Generator
             
-            #>> Regional Ethnicity Branch - based on hair and eyes, what is the ethnicity? cultural relevant regions    
-            reg_ethn_loss = regional_ethn_classifier(fake_B, ethn)
+            # Need to pass generator noisy labels - do they need to be OHEd?
+            gen_gender = Variable(HalfTensor(np.random.randint(0, 2, (opt.batch_size, 1))))
+            gen_ethn = Variable(HalfTensor(np.random.randint(0, 4, (opt.batch_size, 1))))
+            gen_age = Variable(HalfTensor(np.random.randint(0, 3, (opt.batch_size, 1))))
+            gen_labels = torch.cat((gen_gender, gen_ethn, gen_age), dim=1)
+            fake_B = generator(real_A, gen_labels) # needs to go in as floats to the Generator
 
             #>> Adverarial - How fake and how real
             # relativistic loss
@@ -622,20 +514,34 @@ for epoch in range(opt.epoch, opt.n_epochs):
             loss_GAN_g = criterion_GAN(pred_fake - real_pred.detach(), valid) # GAN loss (fake, valid)
 
             # >> Label Loss
-            # D outputs global ethnicity, gender, and age losses
-            # total ethnicity loss - let the regional loss help steer the total ethnicity loss
-            tot_ethn_loss = 1/2*(reg_ethn_loss + criterion_label(eth_f, ethn))
-            # age and gender based on the global face
-            loss_label = tot_ethn_loss + criterion_label(gen_f, gender) + criterion_label(age_f, age)
-              
+            # but then gen labels need to be converted back to flat longs for the CE loss
+            gen_gender = label_formatter(gen_gender)
+            print("size gen_gender:", gen_gender.size())
+            gen_ethn = label_formatter(gen_ethn)
+            gen_age = label_formatter(gen_age)
+            loss_label = criterion_label(gen_f, gen_gender) + criterion_label(eth_f, gen_ethn) + criterion_label(age_f, gen_age)
+      
             #>>Triplet - Structural integrity 
-            loss_Amp, loss_Pha = triplet_fft(fake_B, B1, B2, B3, B4)
-            # Total FFT Loss
-            loss_FFT = 1/2*(loss_Amp + loss_Pha)
+            # triplet loss on the patches of fake_B
+            fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
+            fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
+            fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
+            fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
+            
+            # Here I randomize the negatives
+            random_patches = torch.stack([B1, B2, B3, B4])
+            patch_num = 4
+            # randomize the negatives
+            B1_trip_loss = triplet_loss(fake_B1, B1, random_patches[np.random.randint(patch_num, size=1).item()])
+            B2_trip_loss = triplet_loss(fake_B2, B2, random_patches[np.random.randint(patch_num, size=1).item()])
+            B3_trip_loss = triplet_loss(fake_B3, B3, random_patches[np.random.randint(patch_num, size=1).item()])
+            B4_trip_loss = triplet_loss(fake_B4, B4, random_patches[np.random.randint(patch_num, size=1).item()])
+            loss_triplet_patch = 0.25*(B1_trip_loss + B2_trip_loss + B3_trip_loss + B4_trip_loss)
             
             #>>Temperature loss using Triplet Loss
             # fake_B temps
             TFB_ = vectorize_temps(fake_B)
+            
             # data augmented B temps, serves as negatives
             transform_jit = transforms.ColorJitter(brightness=0.5, contrast=0.75, saturation=1.5, hue=0.5)
             B_tf = transform_jit(real_B)
@@ -646,8 +552,24 @@ for epoch in range(opt.epoch, opt.n_epochs):
             #>>LPIPS loss - perceptual similarity
             loss_pix_g = criterion_lpips(fake_B, real_B)
             
+            #>>Fourier Transform Loss for Each Patch
+            A1f, P1f = fft_components(fake_B1) 
+            A2f, P2f = fft_components(fake_B2)
+            A3f, P3f = fft_components(fake_B3)
+            A4f, P4f = fft_components(fake_B4)
+            
+            A1r, P1r = fft_components(B1)
+            A2r, P2r = fft_components(B2)
+            A3r, P3r = fft_components(B3)
+            A4r, P4r = fft_components(B4)
+            
+            loss_Amp = 0.25*(criterion_amp(A1f, A1r) + criterion_amp(A2f, A2r) + criterion_amp(A3f, A3r) + criterion_amp(A4f, A4r))
+            loss_Pha = 0.25*(criterion_phase(P1f, P1r) + criterion_phase(P2f, P2r) + criterion_phase(P3f, P3r) + criterion_phase(P4f, P4r))
+            loss_FFT = 1/2*(loss_Amp + loss_Pha)
+            
             #>>Total Generator Loss
-            loss_G = loss_GAN_g + loss_label + 0.001*loss_FFT + 0.10*loss_temp_g + loss_pix_g
+
+            loss_G = loss_GAN_g + loss_pix_g + loss_triplet_patch + loss_label + 0.10*loss_temp_g + 0.001*loss_FFT
 
         scaler.scale(loss_G).backward()
         scaler.step(optimizer_G)
@@ -674,20 +596,15 @@ for epoch in range(opt.epoch, opt.n_epochs):
             
             #>> Label Losses
             # real label loss
+            real_gender = label_formatter(labels[:, 0])
+            real_ethn = label_formatter(labels[:, 1])
+            real_age = label_formatter(labels[:, 2])
             # CE(input, target); input => float, target => long tensor
-            real_loss_label = 1/3*(criterion_label(pred_real_gen, gender) + criterion_label(pred_real_ethn, ethn) + criterion_label(pred_real_age, age))
+            real_loss_label = criterion_label(pred_real_gen, real_gender) + criterion_label(pred_real_ethn, real_ethn) + criterion_label(pred_real_age, real_age)
             
-            # fake label loss <- I don't know what will happen here
-            gen_gender = Variable(HalfTensor(np.random.randint(0, 2, (opt.batch_size, 1))))
-            gen_ethn = Variable(HalfTensor(np.random.randint(0, 4, (opt.batch_size, 1))))
-            gen_age = Variable(HalfTensor(np.random.randint(0, 3, (opt.batch_size, 1))))
-            gen_labels = torch.cat((gen_gender, gen_ethn, gen_age), dim=1)
- 
-            gen_gender = label_formatter(gen_gender)
-            gen_ethn = label_formatter(gen_ethn)
-            gen_age = label_formatter(gen_age)
-            fake_loss_label = 1/3*(criterion_label(pred_fake_gen, gen_gender) + criterion_label(pred_fake_ethn, gen_ethn) + criterion_label(pred_fake_age, gen_age))
-           
+            # fake label loss
+            fake_loss_label = criterion_label(pred_fake_gen, gen_gender) + criterion_label(pred_fake_ethn, gen_ethn) + criterion_label(pred_fake_age, gen_age)
+
             # TOTAL LOSSES - average both
             loss_D = 1/2*((loss_real_g + real_loss_label) + (loss_fake_g + fake_loss_label))
             
@@ -711,7 +628,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
 
         # Print log
         sys.stdout.write(
-            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | lpips: %f | temp_G: %f | D_real_lab: %f | D_fake_lab: %f | fft: %f | reg_eth: %f | tot_eth: %f | G_loss_label: % f] ETA: %s"
+            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | trip_G: %f | temp_G: %f | D_real_lab: %f | D_fake_lab: %f | fft: %f | G_loss_label: % f] ETA: %s"
             % (
                 opt.experiment, 
                 epoch, #%d
@@ -722,19 +639,18 @@ for epoch in range(opt.epoch, opt.n_epochs):
                 loss_G.item(), #%f - total G loss
                 loss_GAN_g.item(),
                 loss_pix_g.item(),
+                loss_triplet_patch.item(),
                 loss_temp_g.item(),
                 real_loss_label.item(),
                 fake_loss_label.item(),
                 loss_FFT.item(),
-                reg_ethn_loss.item(),
-                tot_ethn_loss.item(),
                 loss_label.item(),
                 time_left, #%s
             )
         )
 
         f.write(
-            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | lpips: %f | temp_G: %f | D_real_lab: %f | D_fake_lab: %f | fft: %f | reg_eth: %f | tot_eth: %f | G_loss_label: % f] ETA: %s"
+            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | trip_G: %f | temp_G: %f | D_real_lab: %f | D_fake_lab: %f | fft: %f | G_loss_label: % f] ETA: %s"
             % (
                 opt.experiment, 
                 epoch, #%d
@@ -745,12 +661,11 @@ for epoch in range(opt.epoch, opt.n_epochs):
                 loss_G.item(), #%f - total G loss
                 loss_GAN_g.item(),
                 loss_pix_g.item(),
+                loss_triplet_patch.item(),
                 loss_temp_g.item(),
                 real_loss_label.item(),
                 fake_loss_label.item(),
                 loss_FFT.item(),
-                reg_ethn_loss.item(),
-                tot_ethn_loss.item(),
                 loss_label.item(),
                 time_left, #%s
             )

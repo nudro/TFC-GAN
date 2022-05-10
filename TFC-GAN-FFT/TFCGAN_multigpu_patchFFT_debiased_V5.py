@@ -49,9 +49,10 @@ parser.add_argument("--num_ethn", type=int, default=4, help="num ethnicity class
 opt = parser.parse_args()
 
 """
-V4:
+V5:
 
 > fft-patch loss
+> AND pixel-based patch loss
 > lpips loss
 > ethn-regional loss
 > with separate CNN for ethnicity regional classification
@@ -91,6 +92,10 @@ criterion_lpips = LPIPS(
 # FFT Patch Triplet Loss
 criterion_amp = nn.TripletMarginLoss(margin=1.0, p=2)
 criterion_phase = nn.TripletMarginLoss(margin=1.0, p=2)
+
+# Patch Triplet Loss for Pixel Space
+triplet_loss = nn.TripletMarginLoss(margin=1.0, p=2)
+
 # scaling param for temp loss since value will be very small
 lambda_t = 10
 
@@ -379,8 +384,12 @@ def sample_spectra(thermal_tensor):
     
     
 ##############    
-def triplet_fft(fake_B, B1, B2, B3, B4):
-    """ to do on k=16, have to modify this fxn"""
+def triplet_patches(fake_B, B1, B2, B3, B4):
+    """
+    Calculates the losses for both pixel-space and fourier-space.
+    
+    """
+
     # triplet loss on the patches of fake_B
     fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
     fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
@@ -422,8 +431,16 @@ def triplet_fft(fake_B, B1, B2, B3, B4):
     B3_trip_pha = criterion_amp(P3f,P3r,P3K)
     B4_trip_pha = criterion_amp(P4f,P4r,P4K)
     Pha_loss = 1/4*(B1_trip_pha + B2_trip_pha + B3_trip_pha + B4_trip_pha)
+    
+    # randomize the negatives
+    B1_trip_loss = triplet_loss(fake_B1, B1, K1)
+    B2_trip_loss = triplet_loss(fake_B2, B2, K2)
+    B3_trip_loss = triplet_loss(fake_B3, B3, K3)
+    B4_trip_loss = triplet_loss(fake_B4, B4, K4)
+    
+    Patch_loss = 0.25*(B1_trip_loss + B2_trip_loss + B3_trip_loss + B4_trip_loss)
 
-    return Amp_loss, Pha_loss
+    return Amp_loss, Pha_loss, Patch_loss
     
     
 ##############
@@ -454,11 +471,11 @@ def sample_images(batches_done):
     #save_image(img_sample_patch, "images/%s/%s_p.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
     
     # MAGNITUDE SPECTRA
-    fake_spec = sample_spectra(fake_B.data)
-    real_spec = sample_spectra(real_B.data)
-    fake_spec, real_spec = (fake_spec.expand(-1, 3, -1, -1)), (real_spec.expand(-1, 3, -1, -1))
-    img_mag = torch.cat((fake_spec.data, real_spec.data), -2)
-    save_image(img_mag, "images/%s/%s_mag.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
+    #fake_spec = sample_spectra(fake_B.data)
+    #real_spec = sample_spectra(real_B.data)
+    #fake_spec, real_spec = (fake_spec.expand(-1, 3, -1, -1)), (real_spec.expand(-1, 3, -1, -1))
+    #img_mag = torch.cat((fake_spec.data, real_spec.data), -2)
+    #save_image(img_mag, "images/%s/%s_mag.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
     
     # GLOBAL
     img_sample_global = torch.cat((real_A.data, fake_B.data, real_B.data), -2)
@@ -500,13 +517,14 @@ criterion_lpips.cuda() #Global LPIPS Loss
 criterion_temp.cuda() #Global Temp Loss
 criterion_amp.cuda() #Triplet FFT Amplitude Loss
 criterion_phase.cuda() #Triplet FFT Phase Loss
+triplet_loss.cuda()
 
 ################    
 # nn.DataParallel
 ################
 
-generator = torch.nn.DataParallel(generator, device_ids=[1,2])
-discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[1,2])
+generator = torch.nn.DataParallel(generator, device_ids=[0,1,2])
+discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[0,1,2])
 
 if opt.epoch != 0:
     # Load pretrained models /home/local/AD/cordun1/experiments/faPVTgan/saved_models/0209_devcom_TripTemp
@@ -629,9 +647,11 @@ for epoch in range(opt.epoch, opt.n_epochs):
             loss_label = tot_ethn_loss + criterion_label(gen_f, gender) + criterion_label(age_f, age)
               
             #>>Triplet - Structural integrity 
-            loss_Amp, loss_Pha = triplet_fft(fake_B, B1, B2, B3, B4)
+            loss_Amp, loss_Pha, loss_Patchpix = triplet_patches(fake_B, B1, B2, B3, B4)
             # Total FFT Loss
             loss_FFT = 1/2*(loss_Amp + loss_Pha)
+            loss_patch = loss_Patchpix
+            
             
             #>>Temperature loss using Triplet Loss
             # fake_B temps
@@ -647,7 +667,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
             loss_pix_g = criterion_lpips(fake_B, real_B)
             
             #>>Total Generator Loss
-            loss_G = loss_GAN_g + loss_label + 0.001*loss_FFT + 0.10*loss_temp_g + loss_pix_g
+            loss_G = loss_GAN_g + loss_label + 0.001*loss_FFT + loss_patch + 0.10*loss_temp_g + loss_pix_g
 
         scaler.scale(loss_G).backward()
         scaler.step(optimizer_G)
@@ -711,7 +731,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
 
         # Print log
         sys.stdout.write(
-            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | lpips: %f | temp_G: %f | D_real_lab: %f | D_fake_lab: %f | fft: %f | reg_eth: %f | tot_eth: %f | G_loss_label: % f] ETA: %s"
+            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | loss_patch: %f | lpips: %f | temp_G: %f | D_real_lab: %f | D_fake_lab: %f | fft: %f | reg_eth: %f | tot_eth: %f | G_loss_label: % f] ETA: %s"
             % (
                 opt.experiment, 
                 epoch, #%d
@@ -721,6 +741,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
                 loss_D.item(), #%f
                 loss_G.item(), #%f - total G loss
                 loss_GAN_g.item(),
+                loss_patch.item(),
                 loss_pix_g.item(),
                 loss_temp_g.item(),
                 real_loss_label.item(),
@@ -734,7 +755,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
         )
 
         f.write(
-            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | lpips: %f | temp_G: %f | D_real_lab: %f | D_fake_lab: %f | fft: %f | reg_eth: %f | tot_eth: %f | G_loss_label: % f] ETA: %s"
+            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | loss_patch: %f | lpips: %f | temp_G: %f | D_real_lab: %f | D_fake_lab: %f | fft: %f | reg_eth: %f | tot_eth: %f | G_loss_label: % f] ETA: %s"
             % (
                 opt.experiment, 
                 epoch, #%d
@@ -744,6 +765,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
                 loss_D.item(), #%f
                 loss_G.item(), #%f - total G loss
                 loss_GAN_g.item(),
+                loss_patch.item(),
                 loss_pix_g.item(),
                 loss_temp_g.item(),
                 real_loss_label.item(),
