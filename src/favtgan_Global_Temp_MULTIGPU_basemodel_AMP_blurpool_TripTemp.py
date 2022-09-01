@@ -52,9 +52,9 @@ Experimental Temperature-Vector Guided Version
 BLURPOOL
 SINGLE DATASET
 
-You can use this for a single dataset, like training only on Eurecom. 
+You can use this for a single dataset, like training only on Eurecom.
 
-This is a prototype script for: 
+This is a prototype script for:
 > Loads in only A,B all crops are done during training "in situ"
 > AMP
 > HalfTensors
@@ -66,9 +66,9 @@ This is a prototype script for:
 SmallUNET
 1 Discriminators, 1 Generator
 No Patches - Only Global Image
-LPIPS + triplet loss for the patches + triplet loss for the Temperature 
+LPIPS + triplet loss for the patches + triplet loss for the Temperature
 
-Does not use labels, so no annots_csv is fed in. 
+Does not use labels, so no annots_csv is fed in.
 
 """
 
@@ -76,7 +76,7 @@ os.makedirs("/home/local/AD/cordun1/experiments/faPVTgan/images/%s" % opt.experi
 os.makedirs("/home/local/AD/cordun1/experiments/faPVTgan/saved_models/%s" % opt.experiment, exist_ok=True)
 
 cuda = True if torch.cuda.is_available() else False
-torch.cuda.set_device(opt.gpu_num) 
+torch.cuda.set_device(opt.gpu_num)
 
 # Set fixed random number seed
 torch.manual_seed(42)
@@ -114,21 +114,22 @@ print("discriminator patch for global:", patch_for_g) # (1, 16, 16) = N X N
 #conv-relu-blur
 # https://github.com/adobe/antialiased-cnns/issues/8#issuecomment-512602733
 class UNetDown(nn.Module):
+    # torch.nn.Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros', device=None, dtype=None)
     def __init__(self, in_size, out_size, normalize=True, dropout=0.0):
         super(UNetDown, self).__init__()
 
         layers = [nn.Conv2d(in_size, out_size, 4, 1, 1, bias=False)] # originally stride = 2
-        
+
         if normalize:
             layers.append(nn.InstanceNorm2d(out_size))
-        
+
         layers.append(nn.LeakyReLU(0.2))
-        
+
         layers.append(antialiased_cnns.BlurPool(out_size, stride=2)) #downsample stride2
-        
+
         if dropout:
             layers.append(nn.Dropout(dropout))
-        
+
         self.model = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -139,14 +140,14 @@ class UNetDown(nn.Module):
 class UNetUp(nn.Module):
     def __init__(self, in_size, out_size, dropout=0.0):
         super(UNetUp, self).__init__()
-        
+
         layers = [
                 nn.ConvTranspose2d(in_size, out_size, 4, 2, 1, bias=False),
                 antialiased_cnns.BlurPool(out_size, stride=1), #upsampling with stride=1 is just blurring no pooling
                 nn.InstanceNorm2d(out_size),
                 nn.ReLU(inplace=True),
             ]
-            
+
         if dropout:
             layers.append(nn.Dropout(dropout))
 
@@ -185,7 +186,7 @@ class GeneratorUNet(nn.Module):
     def forward(self, x):
         with autocast():
             d1 = self.down1(x)
-            d2 = self.down2(d1)  
+            d2 = self.down2(d1)
             d3 = self.down3(d2)
             d4 = self.down4(d3)
             d5 = self.down5(d4)
@@ -212,10 +213,10 @@ class Discriminator1(nn.Module):
         def discriminator_block(in_filters, out_filters):
             layers = [torch.nn.utils.parametrizations.spectral_norm(
                 nn.Conv2d(in_filters, out_filters, 4, stride=1, padding=1))] # changed to stride=1 instead of 2
-        
+
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             layers.append(antialiased_cnns.BlurPool(out_filters, stride=2)) #blurpool downsample stride=2
-            
+
             return layers
 
         self.model = nn.Sequential(
@@ -251,10 +252,10 @@ def vectorize_temps(fake_B):
         fake_vectorizer = TempVector_PyTorch(b, d) # calls datasets_temp .detach().cpu()
         tfb = torch.Tensor(fake_vectorizer.make_pixel_vectors()).cuda()
         TFB.append(tfb)
-    TFB_tensor = torch.cat(TFB).reshape(opt.batch_size, 1, opt.img_height, opt.img_width)     
+    TFB_tensor = torch.cat(TFB).reshape(opt.batch_size, 1, opt.img_height, opt.img_width)
     return TFB_tensor
- 
-    
+
+
 def weights_init_normal(m):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
@@ -263,13 +264,13 @@ def weights_init_normal(m):
         torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
         torch.nn.init.constant_(m.bias.data, 0.0)
 
-        
+
 def sample_images(batches_done):
     imgs = next(iter(test_dataloader))
     real_A = Variable(imgs["A"].type(HalfTensor))
     real_B = Variable(imgs["B"].type(HalfTensor))
     fake_B = generator(real_A)
-    
+
     fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
     fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
     fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
@@ -278,7 +279,7 @@ def sample_images(batches_done):
     # SAVE PATCHES
     img_sample_patch = torch.cat((fake_B1.data, fake_B2.data, fake_B3.data, fake_B4.data), -2)
     save_image(img_sample_patch, "images/%s/%s_p.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
-    
+
     # GLOBAL
     img_sample_global = torch.cat((real_A.data, fake_B.data, real_B.data), -2)
     save_image(img_sample_global, "images/%s/%s_g.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
@@ -304,7 +305,7 @@ criterion_lpips.cuda()
 triplet_loss.cuda()
 criterion_temp.cuda()
 
-################    
+################
 # nn.DataParallel
 ################
 
@@ -322,7 +323,7 @@ else:
     discriminator1.apply(weights_init_normal)
 
 
-################    
+################
 # Optimizers
 ################
 optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
@@ -385,10 +386,10 @@ print_network(discriminator1, 'discriminator1')
 scaler = GradScaler()
 
 for epoch in range(opt.epoch, opt.n_epochs):
-    
+
     for i, batch in enumerate(dataloader):
         print("****** {} ******\n".format(i))
-        
+
         real_A = Variable(batch["A"].type(HalfTensor))
         real_B = Variable(batch["B"].type(HalfTensor))
         B1 = Variable(batch["B1"].type(HalfTensor))
@@ -409,7 +410,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
         print("+ + + optimizer_G.zero_grad() + + +")
         optimizer_G.zero_grad()
 
-        with autocast(): 
+        with autocast():
             fake_B = generator(real_A)
 
             # Adverarial - How fake and how real
@@ -417,14 +418,14 @@ for epoch in range(opt.epoch, opt.n_epochs):
             pred_fake = discriminator1(fake_B, real_A)
             real_pred = discriminator1(real_B, real_A)
             loss_GAN_g = criterion_GAN(pred_fake - real_pred.detach(), valid)
-      
-            # Triplet - Structural integrity 
+
+            # Triplet - Structural integrity
             # triplet loss on the patches of fake_B
             fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
             fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
             fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
             fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
-            
+
             # Here I randomize the negatives
             random_patches = torch.stack([B1, B2, B3, B4])
             patch_num = 4
@@ -434,22 +435,22 @@ for epoch in range(opt.epoch, opt.n_epochs):
             B3_trip_loss = triplet_loss(fake_B3, B3, random_patches[np.random.randint(patch_num, size=1).item()])
             B4_trip_loss = triplet_loss(fake_B4, B4, random_patches[np.random.randint(patch_num, size=1).item()])
             loss_triplet_patch = 0.25*(B1_trip_loss + B2_trip_loss + B3_trip_loss + B4_trip_loss)
-            
+
             # Temperature loss using Triplet Loss
             # fake_B temps
             TFB_ = vectorize_temps(fake_B)
-            
+
             # data augmented B temps, serves as negatives
             transform_jit = transforms.ColorJitter(brightness=0.5, contrast=0.75, saturation=1.5, hue=0.5)
             B_tf = transform_jit(real_B)
             TBTF = vectorize_temps(B_tf)
             TB = TB.reshape(TB.size(0), 1, TB.size(1), TB.size(2))
-            
+
             loss_temp_g = criterion_temp(TFB_, TB, TBTF)*lambda_t
-            
+
             # LPIPS loss - perceptual similarity
             loss_pix_g = criterion_lpips(fake_B, real_B)
-            
+
             # Total Generator Loss
             loss_G = loss_GAN_g + loss_pix_g + loss_triplet_patch + loss_temp_g
 
@@ -463,11 +464,11 @@ for epoch in range(opt.epoch, opt.n_epochs):
 
         print("+ + + optimizer_D.zero_grad() + + +")
         optimizer_D.zero_grad()
-        
+
         with autocast():
             # real
             pred_real_g = discriminator1(real_B, real_A)
-            #fake 
+            #fake
             pred_fake_g = discriminator1(fake_B.detach(), real_A)
 
             #adv loss
@@ -478,7 +479,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
         scaler.scale(loss_D).backward()
         scaler.step(optimizer_D)
         print("+ + + optimizer_D.step() + + +")
-        
+
         # one scalar update for all scaler
         # instead of one for each model
         scaler.update()
@@ -487,7 +488,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
         #  Log Progress
         # --------------
 
-        batches_done = epoch * len(dataloader) + i  
+        batches_done = epoch * len(dataloader) + i
         batches_left = opt.n_epochs * len(dataloader) - batches_done
         time_left = datetime.timedelta(seconds=batches_left * (time.time() - prev_time))
         prev_time = time.time()
@@ -496,7 +497,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
         sys.stdout.write(
             "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | trip_G: %f | temp_G: %f] ETA: %s"
             % (
-                opt.experiment, 
+                opt.experiment,
                 epoch, #%d
                 opt.n_epochs, #%d
                 i, #%d
@@ -514,7 +515,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
         f.write(
             "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | trip_G: %f | temp_G: %f] ETA: %s"
             % (
-                opt.experiment, 
+                opt.experiment,
                 epoch, #%d
                 opt.n_epochs, #%d
                 i, #%d
@@ -532,7 +533,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
         if batches_done % opt.sample_interval == 0:
             sample_images(batches_done)
 
-                
+
     if opt.checkpoint_interval != -1 and epoch % opt.checkpoint_interval == 0:
         # Save model checkpoints
         torch.save(generator.state_dict(), "/home/local/AD/cordun1/experiments/faPVTgan/saved_models/%s/generator_%d.pth" % (opt.experiment, epoch))
