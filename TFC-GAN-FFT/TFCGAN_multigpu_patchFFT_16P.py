@@ -34,8 +34,8 @@ parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of firs
 parser.add_argument("--n_cpu", type=int, default=8, help="number of cpu threads to use during batch generation")
 parser.add_argument("--img_height", type=int, default=256, help="size of image height")
 parser.add_argument("--img_width", type=int, default=256, help="size of image width")
-parser.add_argument("--patch_height", type=int, default=128, help="size of patch height")
-parser.add_argument("--patch_width", type=int, default=128, help="size of patch width")
+parser.add_argument("--patch_height", type=int, default=64, help="size of patch height")
+parser.add_argument("--patch_width", type=int, default=64, help="size of patch width")
 parser.add_argument("--channels", type=int, default=3, help="number of image channels")
 parser.add_argument("--sample_interval", type=int, default=500, help="interval between sampling of images from generators")
 parser.add_argument("--checkpoint_interval", type=int, default=100, help="interval between model checkpoints")
@@ -47,8 +47,7 @@ opt = parser.parse_args()
 
 """
 Experiment: Adds Fourier GAN Loss
-No patch loss
-Only LPIPS, Temp, Fourier
+16 PATCHES, Training is slow
 
 """
 
@@ -74,7 +73,6 @@ criterion_lpips = LPIPS(
 )
 # Patch Triplet Loss
 triplet_loss = nn.TripletMarginLoss(margin=1.0, p=2)
-
 # scaling param for temp loss since value will be very small
 lambda_t = 10
 
@@ -225,6 +223,35 @@ def weights_init_normal(m):
         torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
         torch.nn.init.constant_(m.bias.data, 0.0)
 
+        
+def make_16_patches(B):
+    # B is real_B or fake_B
+    
+    patch_w = opt.img_width//4
+    patch_h = opt.img_height//4
+    
+    B1 = B[:, :, 0:0+patch_w, 0:0+patch_h] #(x,y) = (0,0)
+    B2 = B[:, :, 0:0+patch_w, 64:64+patch_h] #(x,y) = (0, 64)
+    B3 = B[:, :, 0:0+patch_w, 128:128+patch_h] #(x,y)=(0,128)
+    B4 = B[:, :, 0:0+patch_w, 192:192+patch_h] #(x,y) = (0,192)
+
+    B5 = B[:, :, 64:64+patch_w, 0:0+patch_h] #(64,0)
+    B6 = B[:, :, 64:64+patch_w, 64:64+patch_h] #(64, 64)
+    B7 = B[:, :, 64:64+patch_w, 128:128+patch_h] #(64, 128)
+    B8 = B[:, :, 64:64+patch_w, 192:192+patch_h] #(64, 192)
+
+    B9 = B[:, :, 128:128+patch_w, 0:0+patch_h] #(128,0)
+    B10 = B[:, :, 128:128+patch_w, 64:64+patch_h] #(128,64)
+    B11 = B[:, :, 128:128+patch_w, 128:128+patch_h] #(128,128)
+    B12 = B[:, :, 128:128+patch_w, 192:192+patch_h] #(128,192)
+
+    B13 = B[:, :, 192:192+patch_w, 0:0+patch_h] #(192,0)
+    B14 = B[:, :, 192:192+patch_w, 64:64+patch_h] #(192,64)
+    B15 = B[:, :, 192:192+patch_w, 128:128+patch_h] #(192,128)
+    B16 = B[:, :, 192:192+patch_w, 192:192+patch_h] #(192,192)
+           
+    return B1, B2, B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16
+
 
 # for passing to vectorizer for fake_B temperature calculation
 T = np.linspace(24, 38, num=256) # 0 - 255 indices of temperatures in Celsius
@@ -263,7 +290,7 @@ class FFT_Components(object):
         
     
     
-def fft_components(thermal_tensor):
+def fft_components(thermal_tensor, patch=True):
     # thermal_tensor can be fake_B or real_B
     #print("thermal tensor shape:", thermal_tensor.size())
     AMP = []
@@ -279,9 +306,73 @@ def fft_components(thermal_tensor):
 
     # reshape each amplitude and phase to Torch tensors <- Torch says I can do this faster?
     # For RFFT2 the dims is 256 x 129 for half of all real values + 1 col
-    AMP_tensor = torch.cat(AMP).reshape(opt.batch_size, 1, opt.img_height, 129)    
-    PHA_tensor = torch.cat(PHA).reshape(opt.batch_size, 1, opt.img_height, 129)    
+    # ^^ above was for the full 256 x 256 image - the following is for the patch 128/2 + 1 col
+    aspect = int(128/4 + 1)
+    AMP_tensor = torch.cat(AMP).reshape(opt.batch_size, 1, opt.patch_height, aspect)    
+    PHA_tensor = torch.cat(PHA).reshape(opt.batch_size, 1, opt.patch_height, aspect)    
+    
+    # not patch only for getting global 
+    if not patch:
+        AMP_tensor = torch.cat(AMP).reshape(opt.batch_size, 1, opt.img_height, 129)    
+        PHA_tensor = torch.cat(PHA).reshape(opt.batch_size, 1, opt.img_height, 129)
+    
     return AMP_tensor, PHA_tensor
+
+
+# I need a more Pythonic way of writing this function - it's very unwieldy TODO
+def calculate_ffts(fake_B1, fake_B2, fake_B3, fake_B4,fake_B5,fake_B6, fake_B7, fake_B8, fake_B9, \
+                   fake_B10, fake_B11, fake_B12, fake_B13, fake_B14, fake_B15, fake_B16, B1, B2, \
+                    B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16):
+    A1f, P1f = fft_components(fake_B1) 
+    A2f, P2f = fft_components(fake_B2)
+    A3f, P3f = fft_components(fake_B3)
+    A4f, P4f = fft_components(fake_B4)
+    A5f, P5f = fft_components(fake_B5)
+    A6f, P6f = fft_components(fake_B6)
+    A7f, P7f = fft_components(fake_B7)
+    A8f, P8f = fft_components(fake_B8)
+    A9f, P9f = fft_components(fake_B9)
+    A10f, P10f = fft_components(fake_B10)
+    A11f, P11f = fft_components(fake_B11)
+    A12f, P12f = fft_components(fake_B12)
+    A13f, P13f = fft_components(fake_B13)
+    A14f, P14f = fft_components(fake_B14)
+    A15f, P15f = fft_components(fake_B15)
+    A16f, P16f = fft_components(fake_B16)
+
+    A1r, P1r = fft_components(B1)
+    A2r, P2r = fft_components(B2)
+    A3r, P3r = fft_components(B3)
+    A4r, P4r = fft_components(B4)
+    A5r, P5r = fft_components(B5)
+    A6r, P6r = fft_components(B6)
+    A7r, P7r = fft_components(B7)
+    A8r, P8r = fft_components(B8)
+    A9r, P9r = fft_components(B9)
+    A10r, P10r = fft_components(B10)
+    A11r, P11r = fft_components(B11)
+    A12r, P12r = fft_components(B12)
+    A13r, P13r = fft_components(B13)
+    A14r, P14r = fft_components(B14)
+    A15r, P15r = fft_components(B15)
+    A16r, P16r = fft_components(B16)
+
+    loss_Amp = 1/16*(
+        criterion_amp(A1f, A1r) + criterion_amp(A2f, A2r) + criterion_amp(A3f, A3r) + criterion_amp(A4f, A4r) + criterion_amp(A5f, A5r) + criterion_amp(A6f, A6r) + \
+        criterion_amp(A7f, A7r) + criterion_amp(A8f, A8r) + criterion_amp(A9f, A9r) + criterion_amp(A10f, A10r) + criterion_amp(A11f, A11r) + criterion_amp(A12f, A12r) + \
+        criterion_amp(A13f, A13r) + criterion_amp(A14f, A14r) + criterion_amp(A15f, A15r) + criterion_amp(A16f, A16r)
+    )
+
+
+    loss_Pha = 1/16*(
+        criterion_phase(P1f, P1r) + criterion_phase(P2f, P2r) + criterion_phase(P3f, P3r) + criterion_phase(P4f, P4r) + criterion_phase(P5f, P5r) + criterion_phase(P6f, P6r) + \
+        criterion_phase(P7f, P7r) + criterion_phase(P8f, P8r) + criterion_phase(P9f, P9r) + criterion_phase(P10f, P10r) + criterion_phase(P11f, P11r) + criterion_phase(P12f, P12r) + \
+        criterion_phase(P13f, P13r) + criterion_phase(P14f, P14r) + criterion_phase(P15f, P15r) + criterion_phase(P16f, P16r)
+    )
+
+    loss_FFT = 1/2*(loss_Amp + loss_Pha)
+
+    return loss_FFT
     
     
 def sample_spectra(thermal_tensor):
@@ -294,7 +385,6 @@ def sample_spectra(thermal_tensor):
             SPEC.append(spectra)
             
     SPEC_tensor = torch.cat(SPEC).reshape(thermal_tensor.size(0), 1, opt.img_height, opt.img_width)    
-    
     return SPEC_tensor
     
     
@@ -304,14 +394,14 @@ def sample_images(batches_done):
     real_B = Variable(imgs["B"].type(HalfTensor))
     fake_B = generator(real_A)
     
-    #fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
-    #fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
-    #fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
-    #fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
+    fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
+    fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
+    fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
+    fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
 
     # SAVE PATCHES
-    #img_sample_patch = torch.cat((fake_B1.data, fake_B2.data, fake_B3.data, fake_B4.data), -2)
-    #save_image(img_sample_patch, "images/%s/%s_p.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
+    img_sample_patch = torch.cat((fake_B1.data, fake_B2.data, fake_B3.data, fake_B4.data), -2)
+    save_image(img_sample_patch, "images/%s/%s_p.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
     
     # MAGNITUDE SPECTRA
     fake_spec = sample_spectra(fake_B.data)
@@ -319,6 +409,7 @@ def sample_images(batches_done):
     fake_spec, real_spec = (fake_spec.expand(-1, 3, -1, -1)), (real_spec.expand(-1, 3, -1, -1))
     img_mag = torch.cat((fake_spec.data, real_spec.data), -2)
     save_image(img_mag, "images/%s/%s_mag.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
+
     
     # GLOBAL
     img_sample_global = torch.cat((real_A.data, fake_B.data, real_B.data), -2)
@@ -350,8 +441,8 @@ criterion_phase.cuda()
 # nn.DataParallel
 ################
 
-generator = torch.nn.DataParallel(generator, device_ids=[0,1])
-discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[0,1])
+generator = torch.nn.DataParallel(generator, device_ids=[0,2])
+discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[0,2])
 
 if opt.epoch != 0:
     # Load pretrained models /home/local/AD/cordun1/experiments/faPVTgan/saved_models/0209_devcom_TripTemp
@@ -437,6 +528,9 @@ for epoch in range(opt.epoch, opt.n_epochs):
         B3 = Variable(batch["B3"].type(HalfTensor))
         B4 = Variable(batch["B4"].type(HalfTensor))
         TB = Variable(batch["T_B"].type(HalfTensor))
+        
+        # Crop real_B patches into 16
+        B1, B2, B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16 = make_16_patches(real_B)
 
         # Adversarial ground truths: global image
         valid_ones = Variable(HalfTensor(np.ones((real_A.size(0), *patch_for_g))), requires_grad=False)
@@ -461,20 +555,32 @@ for epoch in range(opt.epoch, opt.n_epochs):
       
             # Triplet - Structural integrity 
             # triplet loss on the patches of fake_B
-            fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
-            fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
-            fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
-            fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
-            
+            fake_B1, fake_B2, fake_B3, fake_B4,fake_B5,fake_B6, fake_B7, fake_B8, fake_B9, fake_B10, fake_B11, fake_B12, fake_B13, fake_B14, fake_B15, fake_B16 = make_16_patches(fake_B)
+
+            # TO DO - CAN ABSTRACT THIS OUT MORE - Write a function
             # Here I randomize the negatives
-            random_patches = torch.stack([B1, B2, B3, B4])
-            patch_num = 4
+            random_patches = torch.stack([B1, B2, B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16])
+            patch_num = 16
             # randomize the negatives
             B1_trip_loss = triplet_loss(fake_B1, B1, random_patches[np.random.randint(patch_num, size=1).item()])
             B2_trip_loss = triplet_loss(fake_B2, B2, random_patches[np.random.randint(patch_num, size=1).item()])
             B3_trip_loss = triplet_loss(fake_B3, B3, random_patches[np.random.randint(patch_num, size=1).item()])
             B4_trip_loss = triplet_loss(fake_B4, B4, random_patches[np.random.randint(patch_num, size=1).item()])
-            loss_triplet_patch = 0.25*(B1_trip_loss + B2_trip_loss + B3_trip_loss + B4_trip_loss)
+            B5_trip_loss = triplet_loss(fake_B5, B5, random_patches[np.random.randint(patch_num, size=1).item()])
+            B6_trip_loss = triplet_loss(fake_B6, B6, random_patches[np.random.randint(patch_num, size=1).item()])
+            B7_trip_loss = triplet_loss(fake_B7, B7, random_patches[np.random.randint(patch_num, size=1).item()])
+            B8_trip_loss = triplet_loss(fake_B8, B8, random_patches[np.random.randint(patch_num, size=1).item()])
+            B9_trip_loss = triplet_loss(fake_B9, B9, random_patches[np.random.randint(patch_num, size=1).item()])
+            B10_trip_loss = triplet_loss(fake_B10, B10, random_patches[np.random.randint(patch_num, size=1).item()])
+            B11_trip_loss = triplet_loss(fake_B11, B11, random_patches[np.random.randint(patch_num, size=1).item()])
+            B12_trip_loss = triplet_loss(fake_B12, B12, random_patches[np.random.randint(patch_num, size=1).item()])
+            B13_trip_loss = triplet_loss(fake_B13, B13, random_patches[np.random.randint(patch_num, size=1).item()])
+            B14_trip_loss = triplet_loss(fake_B14, B14, random_patches[np.random.randint(patch_num, size=1).item()])
+            B15_trip_loss = triplet_loss(fake_B15, B15, random_patches[np.random.randint(patch_num, size=1).item()])
+            B16_trip_loss = triplet_loss(fake_B16, B16, random_patches[np.random.randint(patch_num, size=1).item()])
+           
+            loss_triplet_patch = 1/16*(B1_trip_loss + B2_trip_loss + B3_trip_loss + B4_trip_loss + B5_trip_loss + B6_trip_loss + B7_trip_loss + B8_trip_loss +
+                                      B9_trip_loss + B10_trip_loss + B11_trip_loss + B12_trip_loss + B13_trip_loss + B14_trip_loss + B15_trip_loss + B16_trip_loss)
             
             # Temperature loss using Triplet Loss
             # fake_B temps
@@ -491,17 +597,15 @@ for epoch in range(opt.epoch, opt.n_epochs):
             # LPIPS loss - perceptual similarity
             loss_pix_g = criterion_lpips(fake_B, real_B)
             
-            # Fourier Transform Loss
-            Amp_f, Pha_f = fft_components(fake_B) # will pass a batch in
-            Amp_r, Pha_r = fft_components(real_B)
-            loss_Amp = criterion_amp(Amp_f, Amp_r)
-            loss_Pha = criterion_phase(Pha_f, Pha_r)
-            loss_FFT = 1/2*(loss_Amp + loss_Pha)
-            
+            # Fourier Transform Loss for Each Patch
+            loss_FFT = calculate_ffts(fake_B1, fake_B2, fake_B3, fake_B4,fake_B5,fake_B6, fake_B7, fake_B8, fake_B9, \
+                   fake_B10, fake_B11, fake_B12, fake_B13, fake_B14, fake_B15, fake_B16, B1, B2, \
+                    B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16)
+
             # Total Generator Loss
             # GAN G: 0.696318 | pix_G: 51.789307 | trip_G: 1.382264 | temp_G: 147.511887 | fft: 2612.587891
-            
             loss_G = 0.5*loss_GAN_g + 0.5*loss_pix_g + loss_triplet_patch + 0.5*loss_temp_g + 1/100*loss_FFT
+
 
         scaler.scale(loss_G).backward()
         scaler.step(optimizer_G)
@@ -544,7 +648,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
 
         # Print log
         sys.stdout.write(
-            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | patch: %f | temp_G: %f | fft: %f] ETA: %s"
+            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | trip_G: %f | temp_G: %f | fft: %f] ETA: %s"
             % (
                 opt.experiment, 
                 epoch, #%d
@@ -563,7 +667,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
         )
 
         f.write(
-            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | patch: %f | temp_G: %f | fft: %f] ETA: %s"
+            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | trip_G: %f | temp_G: %f | fft: %f] ETA: %s"
             % (
                 opt.experiment, 
                 epoch, #%d
@@ -589,6 +693,5 @@ for epoch in range(opt.epoch, opt.n_epochs):
         # Save model checkpoints
         torch.save(generator.state_dict(), "/home/local/AD/cordun1/experiments/TFC-GAN/saved_models/%s/generator_%d.pth" % (opt.experiment, epoch))
         torch.save(discriminator1.state_dict(), "/home/local/AD/cordun1/experiments/TFC-GAN/saved_models/%s/discriminator1_%d.pth" % (opt.experiment, epoch))
-
-
+    
 f.close()

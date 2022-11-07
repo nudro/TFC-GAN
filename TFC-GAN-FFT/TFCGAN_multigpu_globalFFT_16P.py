@@ -21,7 +21,8 @@ from torch.distributed import Backend
 import antialiased_cnns
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
-from datasets_temp import *
+#from datasets_temp import *
+from datasets_temp_nopatch import *
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--epoch", type=int, default=0, help="epoch to start training from")
@@ -49,7 +50,7 @@ opt = parser.parse_args()
 Experiment: Adds Fourier GAN Loss
 No patch loss
 Only LPIPS, Temp, Fourier
-
+16P Global 
 """
 
 os.makedirs("/home/local/AD/cordun1/experiments/TFC-GAN/images/%s" % opt.experiment, exist_ok=True)
@@ -225,6 +226,33 @@ def weights_init_normal(m):
         torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
         torch.nn.init.constant_(m.bias.data, 0.0)
 
+def make_16_patches(B):
+    # B is real_B or fake_B
+    patch_w = opt.img_width//4
+    patch_h = opt.img_height//4
+    
+    B1 = B[:, :, 0:0+patch_w, 0:0+patch_h] #(x,y) = (0,0)
+    B2 = B[:, :, 0:0+patch_w, 64:64+patch_h] #(x,y) = (0, 64)
+    B3 = B[:, :, 0:0+patch_w, 128:128+patch_h] #(x,y)=(0,128)
+    B4 = B[:, :, 0:0+patch_w, 192:192+patch_h] #(x,y) = (0,192)
+
+    B5 = B[:, :, 64:64+patch_w, 0:0+patch_h] #(64,0)
+    B6 = B[:, :, 64:64+patch_w, 64:64+patch_h] #(64, 64)
+    B7 = B[:, :, 64:64+patch_w, 128:128+patch_h] #(64, 128)
+    B8 = B[:, :, 64:64+patch_w, 192:192+patch_h] #(64, 192)
+
+    B9 = B[:, :, 128:128+patch_w, 0:0+patch_h] #(128,0)
+    B10 = B[:, :, 128:128+patch_w, 64:64+patch_h] #(128,64)
+    B11 = B[:, :, 128:128+patch_w, 128:128+patch_h] #(128,128)
+    B12 = B[:, :, 128:128+patch_w, 192:192+patch_h] #(128,192)
+
+    B13 = B[:, :, 192:192+patch_w, 0:0+patch_h] #(192,0)
+    B14 = B[:, :, 192:192+patch_w, 64:64+patch_h] #(192,64)
+    B15 = B[:, :, 192:192+patch_w, 128:128+patch_h] #(192,128)
+    B16 = B[:, :, 192:192+patch_w, 192:192+patch_h] #(192,192)
+           
+    return B1, B2, B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16
+
 
 # for passing to vectorizer for fake_B temperature calculation
 T = np.linspace(24, 38, num=256) # 0 - 255 indices of temperatures in Celsius
@@ -277,6 +305,7 @@ def fft_components(thermal_tensor):
         AMP.append(amp)
         PHA.append(phase)
 
+    # Remember, Global, Only runs FFT on the entire image (fake_B); so the below is all we need
     # reshape each amplitude and phase to Torch tensors <- Torch says I can do this faster?
     # For RFFT2 the dims is 256 x 129 for half of all real values + 1 col
     AMP_tensor = torch.cat(AMP).reshape(opt.batch_size, 1, opt.img_height, 129)    
@@ -294,7 +323,6 @@ def sample_spectra(thermal_tensor):
             SPEC.append(spectra)
             
     SPEC_tensor = torch.cat(SPEC).reshape(thermal_tensor.size(0), 1, opt.img_height, opt.img_width)    
-    
     return SPEC_tensor
     
     
@@ -303,26 +331,17 @@ def sample_images(batches_done):
     real_A = Variable(imgs["A"].type(HalfTensor))
     real_B = Variable(imgs["B"].type(HalfTensor))
     fake_B = generator(real_A)
-    
-    #fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
-    #fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
-    #fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
-    #fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
-
-    # SAVE PATCHES
-    #img_sample_patch = torch.cat((fake_B1.data, fake_B2.data, fake_B3.data, fake_B4.data), -2)
-    #save_image(img_sample_patch, "images/%s/%s_p.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
-    
+       
     # MAGNITUDE SPECTRA
     fake_spec = sample_spectra(fake_B.data)
     real_spec = sample_spectra(real_B.data)
     fake_spec, real_spec = (fake_spec.expand(-1, 3, -1, -1)), (real_spec.expand(-1, 3, -1, -1))
     img_mag = torch.cat((fake_spec.data, real_spec.data), -2)
-    save_image(img_mag, "images/%s/%s_mag.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
+    save_image(img_mag, "/home/local/AD/cordun1/experiments/TFC-GAN/images/%s/%s_mag.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
     
     # GLOBAL
     img_sample_global = torch.cat((real_A.data, fake_B.data, real_B.data), -2)
-    save_image(img_sample_global, "images/%s/%s_g.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
+    save_image(img_sample_global, "/home/local/AD/cordun1/experiments/TFC-GAN/images/%s/%s_g.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
     
     
 
@@ -350,8 +369,8 @@ criterion_phase.cuda()
 # nn.DataParallel
 ################
 
-generator = torch.nn.DataParallel(generator, device_ids=[0,1])
-discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[0,1])
+generator = torch.nn.DataParallel(generator, device_ids=[1,2])
+discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[1,2])
 
 if opt.epoch != 0:
     # Load pretrained models /home/local/AD/cordun1/experiments/faPVTgan/saved_models/0209_devcom_TripTemp
@@ -432,11 +451,10 @@ for epoch in range(opt.epoch, opt.n_epochs):
         
         real_A = Variable(batch["A"].type(HalfTensor))
         real_B = Variable(batch["B"].type(HalfTensor))
-        B1 = Variable(batch["B1"].type(HalfTensor))
-        B2 = Variable(batch["B2"].type(HalfTensor))
-        B3 = Variable(batch["B3"].type(HalfTensor))
-        B4 = Variable(batch["B4"].type(HalfTensor))
         TB = Variable(batch["T_B"].type(HalfTensor))
+        
+        # Crop real_B patches into 16
+        B1, B2, B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16 = make_16_patches(real_B)
 
         # Adversarial ground truths: global image
         valid_ones = Variable(HalfTensor(np.ones((real_A.size(0), *patch_for_g))), requires_grad=False)
@@ -461,20 +479,32 @@ for epoch in range(opt.epoch, opt.n_epochs):
       
             # Triplet - Structural integrity 
             # triplet loss on the patches of fake_B
-            fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
-            fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
-            fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
-            fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
-            
+            fake_B1, fake_B2, fake_B3, fake_B4,fake_B5,fake_B6, fake_B7, fake_B8, fake_B9, fake_B10, fake_B11, fake_B12, fake_B13, fake_B14, fake_B15, fake_B16 = make_16_patches(fake_B)
+
+            # TO DO - CAN ABSTRACT THIS OUT MORE - Write a function
             # Here I randomize the negatives
-            random_patches = torch.stack([B1, B2, B3, B4])
-            patch_num = 4
+            random_patches = torch.stack([B1, B2, B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16])
+            patch_num = 16
             # randomize the negatives
             B1_trip_loss = triplet_loss(fake_B1, B1, random_patches[np.random.randint(patch_num, size=1).item()])
             B2_trip_loss = triplet_loss(fake_B2, B2, random_patches[np.random.randint(patch_num, size=1).item()])
             B3_trip_loss = triplet_loss(fake_B3, B3, random_patches[np.random.randint(patch_num, size=1).item()])
             B4_trip_loss = triplet_loss(fake_B4, B4, random_patches[np.random.randint(patch_num, size=1).item()])
-            loss_triplet_patch = 0.25*(B1_trip_loss + B2_trip_loss + B3_trip_loss + B4_trip_loss)
+            B5_trip_loss = triplet_loss(fake_B5, B5, random_patches[np.random.randint(patch_num, size=1).item()])
+            B6_trip_loss = triplet_loss(fake_B6, B6, random_patches[np.random.randint(patch_num, size=1).item()])
+            B7_trip_loss = triplet_loss(fake_B7, B7, random_patches[np.random.randint(patch_num, size=1).item()])
+            B8_trip_loss = triplet_loss(fake_B8, B8, random_patches[np.random.randint(patch_num, size=1).item()])
+            B9_trip_loss = triplet_loss(fake_B9, B9, random_patches[np.random.randint(patch_num, size=1).item()])
+            B10_trip_loss = triplet_loss(fake_B10, B10, random_patches[np.random.randint(patch_num, size=1).item()])
+            B11_trip_loss = triplet_loss(fake_B11, B11, random_patches[np.random.randint(patch_num, size=1).item()])
+            B12_trip_loss = triplet_loss(fake_B12, B12, random_patches[np.random.randint(patch_num, size=1).item()])
+            B13_trip_loss = triplet_loss(fake_B13, B13, random_patches[np.random.randint(patch_num, size=1).item()])
+            B14_trip_loss = triplet_loss(fake_B14, B14, random_patches[np.random.randint(patch_num, size=1).item()])
+            B15_trip_loss = triplet_loss(fake_B15, B15, random_patches[np.random.randint(patch_num, size=1).item()])
+            B16_trip_loss = triplet_loss(fake_B16, B16, random_patches[np.random.randint(patch_num, size=1).item()])
+           
+            loss_triplet_patch = 1/16*(B1_trip_loss + B2_trip_loss + B3_trip_loss + B4_trip_loss + B5_trip_loss + B6_trip_loss + B7_trip_loss + B8_trip_loss +
+                                      B9_trip_loss + B10_trip_loss + B11_trip_loss + B12_trip_loss + B13_trip_loss + B14_trip_loss + B15_trip_loss + B16_trip_loss)
             
             # Temperature loss using Triplet Loss
             # fake_B temps

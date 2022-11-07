@@ -11,7 +11,6 @@ from torchvision.utils import save_image
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import datasets
 from torch.autograd import Variable
-from datasets_temp import *  # temperature
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
@@ -299,7 +298,6 @@ def sample_spectra(thermal_tensor):
             SPEC.append(spectra)
             
     SPEC_tensor = torch.cat(SPEC).reshape(thermal_tensor.size(0), 1, opt.img_height, opt.img_width)    
-    
     return SPEC_tensor
     
     
@@ -309,14 +307,14 @@ def sample_images(batches_done):
     real_B = Variable(imgs["B"].type(HalfTensor))
     fake_B = generator(real_A)
     
-    #fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
-    #fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
-    #fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
-    #fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
+    fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
+    fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
+    fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
+    fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
 
     # SAVE PATCHES
-    #img_sample_patch = torch.cat((fake_B1.data, fake_B2.data, fake_B3.data, fake_B4.data), -2)
-    #save_image(img_sample_patch, "images/%s/%s_p.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
+    img_sample_patch = torch.cat((fake_B1.data, fake_B2.data, fake_B3.data, fake_B4.data), -2)
+    save_image(img_sample_patch, "images/%s/%s_p.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
     
     # MAGNITUDE SPECTRA
     fake_spec = sample_spectra(fake_B.data)
@@ -324,6 +322,7 @@ def sample_images(batches_done):
     fake_spec, real_spec = (fake_spec.expand(-1, 3, -1, -1)), (real_spec.expand(-1, 3, -1, -1))
     img_mag = torch.cat((fake_spec.data, real_spec.data), -2)
     save_image(img_mag, "images/%s/%s_mag.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
+
     
     # GLOBAL
     img_sample_global = torch.cat((real_A.data, fake_B.data, real_B.data), -2)
@@ -355,8 +354,8 @@ criterion_phase.cuda()
 # nn.DataParallel
 ################
 
-generator = torch.nn.DataParallel(generator, device_ids=[0,1])
-discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[0,1])
+generator = torch.nn.DataParallel(generator, device_ids=[1,2])
+discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[1,2])
 
 if opt.epoch != 0:
     # Load pretrained models /home/local/AD/cordun1/experiments/faPVTgan/saved_models/0209_devcom_TripTemp
@@ -601,6 +600,5 @@ for epoch in range(opt.epoch, opt.n_epochs):
         # Save model checkpoints
         torch.save(generator.state_dict(), "/home/local/AD/cordun1/experiments/TFC-GAN/saved_models/%s/generator_%d.pth" % (opt.experiment, epoch))
         torch.save(discriminator1.state_dict(), "/home/local/AD/cordun1/experiments/TFC-GAN/saved_models/%s/discriminator1_%d.pth" % (opt.experiment, epoch))
-        #torch.save(discriminator2.state_dict(), "/home/local/AD/cordun1/experiments/faPVTgan/saved_models/%s/discriminator2_%d.pth" % (opt.experiment, epoch))
-
+    
 f.close()

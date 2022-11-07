@@ -11,6 +11,7 @@ from torchvision.utils import save_image
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import datasets
 from torch.autograd import Variable
+from datasets_temp import *  # temperature
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
@@ -21,7 +22,7 @@ from torch.distributed import Backend
 import antialiased_cnns
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
-from datasets_temp import *
+from datasets_notemp import * # <- No Temperature Vector, and No Patches since this is 16P version
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--epoch", type=int, default=0, help="epoch to start training from")
@@ -46,9 +47,7 @@ parser.add_argument("--local_rank", type=int, default=1, help="number GPUs")
 opt = parser.parse_args()
 
 """
-Experiment: Adds Fourier GAN Loss
-No patch loss
-Only LPIPS, Temp, Fourier
+ABLATION - No Temperature Loss, all else the same
 
 """
 
@@ -65,25 +64,15 @@ torch.manual_seed(42)
 # Loss functions
 #################
 
-# Adversarial
 criterion_GAN = torch.nn.BCEWithLogitsLoss()
-# LPIPS
 criterion_lpips = LPIPS(
     net_type='vgg',  # choose a network type from ['alex', 'squeeze', 'vgg']
     version='0.1'  # Currently, v0.1 is supported
 )
-# Patch Triplet Loss
 triplet_loss = nn.TripletMarginLoss(margin=1.0, p=2)
-
 # scaling param for temp loss since value will be very small
 lambda_t = 10
-
-# Temp Triplet Loss
-criterion_temp = nn.TripletMarginLoss(margin=1.0, p=2)
-
-# Fourier Amplitude and Phase Losses
-criterion_amp = nn.L1Loss()
-criterion_phase = nn.L1Loss()
+#criterion_temp = nn.TripletMarginLoss(margin=1.0, p=2)
 
 ################
 # Discr. Patches
@@ -104,18 +93,17 @@ print("discriminator patch for global:", patch_for_g) # (1, 16, 16) = N X N
 class UNetDown(nn.Module):
     def __init__(self, in_size, out_size, normalize=True, dropout=0.0):
         super(UNetDown, self).__init__()
-        layers = [nn.Conv2d(in_size, out_size, 4, 1, 1, bias=False)] # originally stride = 2       
+        layers = [nn.Conv2d(in_size, out_size, 4, 1, 1, bias=False)] # originally stride = 2
         if normalize:
-            layers.append(nn.InstanceNorm2d(out_size))      
-        layers.append(nn.LeakyReLU(0.2))       
-        layers.append(antialiased_cnns.BlurPool(out_size, stride=2)) #downsample stride2    
+            layers.append(nn.InstanceNorm2d(out_size))
+        layers.append(nn.LeakyReLU(0.2))
+        layers.append(antialiased_cnns.BlurPool(out_size, stride=2)) #downsample stride2
         if dropout:
             layers.append(nn.Dropout(dropout))
         self.model = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.model(x)
-
 
 class UNetUp(nn.Module):
     def __init__(self, in_size, out_size, dropout=0.0):
@@ -133,6 +121,7 @@ class UNetUp(nn.Module):
     def forward(self, x, skip_input):
         x = self.model(x)
         x = torch.cat((x, skip_input), 1)
+
         return x
 
 class GeneratorUNet(nn.Module):
@@ -216,16 +205,7 @@ class Discriminator1(nn.Module):
 ##############################
 #       Utils
 ##############################
-
-def weights_init_normal(m):
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
-    elif classname.find("BatchNorm2d") != -1:
-        torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
-        torch.nn.init.constant_(m.bias.data, 0.0)
-
-
+"""
 # for passing to vectorizer for fake_B temperature calculation
 T = np.linspace(24, 38, num=256) # 0 - 255 indices of temperatures in Celsius
 d = dict(enumerate((T).flatten(), 0)) # dictionary like {0: 24.0, 1: 24.054901960784314, etc.}
@@ -239,98 +219,71 @@ def vectorize_temps(fake_B):
         TFB.append(tfb)
     TFB_tensor = torch.cat(TFB).reshape(opt.batch_size, 1, opt.img_height, opt.img_width)     
     return TFB_tensor
-
-      
-class FFT_Components(object):
-
-    def __init__(self, image):
-        self.image = image
-   
-    def make_components(self):
-        img = np.array(self.image) #turn into numpy
-        f_result = np.fft.rfft2(img) 
-        fshift = np.fft.fftshift(f_result)
-        amp = np.abs(fshift)
-        phase = np.arctan2(fshift.imag,fshift.real)
-        return amp, phase
+""" 
     
-    def make_spectra(self):
-        img = np.array(self.image) #turn into numpy
-        f_result = np.fft.fft2(img) # setting this to regular FFT2 to make magnitude spectra
-        fshift = np.fft.fftshift(f_result)
-        magnitude_spectrum = np.log(np.abs(fshift)) 
-        return magnitude_spectrum
+def weights_init_normal(m):
+    classname = m.__class__.__name__
+    if classname.find("Conv") != -1:
+        torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find("BatchNorm2d") != -1:
+        torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
+        torch.nn.init.constant_(m.bias.data, 0.0)
+
+    
+def make_16_patches(B):
+    # B is real_B or fake_B
+    
+    patch_w = opt.img_width//4
+    patch_h = opt.img_height//4
+    
+    B1 = B[:, :, 0:0+patch_w, 0:0+patch_h] #(x,y) = (0,0)
+    B2 = B[:, :, 0:0+patch_w, 64:64+patch_h] #(x,y) = (0, 64)
+    B3 = B[:, :, 0:0+patch_w, 128:128+patch_h] #(x,y)=(0,128)
+    B4 = B[:, :, 0:0+patch_w, 192:192+patch_h] #(x,y) = (0,192)
+
+    B5 = B[:, :, 64:64+patch_w, 0:0+patch_h] #(64,0)
+    B6 = B[:, :, 64:64+patch_w, 64:64+patch_h] #(64, 64)
+    B7 = B[:, :, 64:64+patch_w, 128:128+patch_h] #(64, 128)
+    B8 = B[:, :, 64:64+patch_w, 192:192+patch_h] #(64, 192)
+
+    B9 = B[:, :, 128:128+patch_w, 0:0+patch_h] #(128,0)
+    B10 = B[:, :, 128:128+patch_w, 64:64+patch_h] #(128,64)
+    B11 = B[:, :, 128:128+patch_w, 128:128+patch_h] #(128,128)
+    B12 = B[:, :, 128:128+patch_w, 192:192+patch_h] #(128,192)
+
+    B13 = B[:, :, 192:192+patch_w, 0:0+patch_h] #(192,0)
+    B14 = B[:, :, 192:192+patch_w, 64:64+patch_h] #(192,64)
+    B15 = B[:, :, 192:192+patch_w, 128:128+patch_h] #(192,128)
+    B16 = B[:, :, 192:192+patch_w, 192:192+patch_h] #(192,192)
+           
+    return B1, B2, B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16
+
         
-    
-    
-def fft_components(thermal_tensor):
-    # thermal_tensor can be fake_B or real_B
-    #print("thermal tensor shape:", thermal_tensor.size())
-    AMP = []
-    PHA = []
-    for t in range(0, opt.batch_size): 
-        # thermal images must be in grayscale (1 channel)
-        b = transforms.ToPILImage()(thermal_tensor[t, :, :, :]).convert("L")
-        fft_space = FFT_Components(b)
-        amp, phase = torch.Tensor(fft_space.make_components()).cuda() # convert them into torch tensors
-        #print("Shape of amp tensor:", amp.size())
-        AMP.append(amp)
-        PHA.append(phase)
-
-    # reshape each amplitude and phase to Torch tensors <- Torch says I can do this faster?
-    # For RFFT2 the dims is 256 x 129 for half of all real values + 1 col
-    AMP_tensor = torch.cat(AMP).reshape(opt.batch_size, 1, opt.img_height, 129)    
-    PHA_tensor = torch.cat(PHA).reshape(opt.batch_size, 1, opt.img_height, 129)    
-    return AMP_tensor, PHA_tensor
-    
-    
-def sample_spectra(thermal_tensor):
-    SPEC =[]
-    for t in range(0, thermal_tensor.size(0)): 
-            # thermal images must be in grayscale (1 channel)
-            b = transforms.ToPILImage()(thermal_tensor[t, :, :, :]).convert("L")
-            fft_space = FFT_Components(b)
-            spectra = torch.Tensor(fft_space.make_spectra()).cuda() # convert to torch tensor
-            SPEC.append(spectra)
-            
-    SPEC_tensor = torch.cat(SPEC).reshape(thermal_tensor.size(0), 1, opt.img_height, opt.img_width)    
-    
-    return SPEC_tensor
-    
-    
 def sample_images(batches_done):
     imgs = next(iter(test_dataloader))
     real_A = Variable(imgs["A"].type(HalfTensor))
     real_B = Variable(imgs["B"].type(HalfTensor))
     fake_B = generator(real_A)
-    
-    #fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
-    #fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
-    #fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
-    #fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
+           
+    """When you make the test script, load the UTIL above to make_16_patches(real_B) and fake_B"""
 
     # SAVE PATCHES
+    # Save for inference
     #img_sample_patch = torch.cat((fake_B1.data, fake_B2.data, fake_B3.data, fake_B4.data), -2)
     #save_image(img_sample_patch, "images/%s/%s_p.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
     
-    # MAGNITUDE SPECTRA
-    fake_spec = sample_spectra(fake_B.data)
-    real_spec = sample_spectra(real_B.data)
-    fake_spec, real_spec = (fake_spec.expand(-1, 3, -1, -1)), (real_spec.expand(-1, 3, -1, -1))
-    img_mag = torch.cat((fake_spec.data, real_spec.data), -2)
-    save_image(img_mag, "images/%s/%s_mag.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
-    
     # GLOBAL
     img_sample_global = torch.cat((real_A.data, fake_B.data, real_B.data), -2)
-    save_image(img_sample_global, "images/%s/%s_g.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
-    
-    
+    save_image(img_sample_global, "/home/local/AD/cordun1/experiments/TFC-GAN/images/%s/%s_g.png" % (opt.experiment, batches_done), nrow=5, normalize=True)
+
 
 ##############################
 #       Initialize
 ##############################
 
+
 # Initialize generator and discriminator
+#input_shape_patch = (opt.channels, opt.patch_height, opt.patch_width)
 input_shape_global = (opt.channels, opt.img_height, opt.img_width)
 
 generator = GeneratorUNet(input_shape_global)
@@ -342,19 +295,17 @@ discriminator1 = discriminator1.cuda()
 criterion_GAN.cuda()
 criterion_lpips.cuda()
 triplet_loss.cuda()
-criterion_temp.cuda()
-criterion_amp.cuda()
-criterion_phase.cuda()
+#criterion_temp.cuda()
 
 ################    
 # nn.DataParallel
 ################
 
-generator = torch.nn.DataParallel(generator, device_ids=[0,1])
-discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[0,1])
+generator = torch.nn.DataParallel(generator, device_ids=[1,2])
+discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[1,2])
 
 if opt.epoch != 0:
-    # Load pretrained models /home/local/AD/cordun1/experiments/faPVTgan/saved_models/0209_devcom_TripTemp
+    # Load pretrained models
     generator.load_state_dict(torch.load("/home/local/AD/cordun1/experiments/TFC-GAN/saved_models/%s/generator_%d.pth" % (opt.experiment, opt.epoch)))
     discriminator1.load_state_dict(torch.load("/home/local/AD/cordun1/experiments/TFC-GAN/saved_models/%s/discriminator1_%d.pth" % (opt.experiment, opt.epoch)))
 
@@ -370,15 +321,6 @@ else:
 optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 optimizer_D = torch.optim.Adam(discriminator1.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 
-
-def print_network(model, name):
-    """Print out the network information."""
-    num_params = 0
-    for p in model.parameters():
-        num_params += p.numel()
-    print(model)
-    print(name)
-    print("The number of parameters: {}".format(num_params))
 
 ##############################
 # Transforms and Dataloaders
@@ -420,23 +362,16 @@ prev_time = time.time()
 
 f = open('/home/local/AD/cordun1/experiments/TFC-GAN/LOGS/{}.txt'.format(opt.out_file), 'a+')
 
-#print_network(generator, 'generator')
-#print_network(discriminator1, 'discriminator1')
-
 # Try AMP
 scaler = GradScaler()
 
 for epoch in range(opt.epoch, opt.n_epochs):
-    
     for i, batch in enumerate(dataloader):
-        
         real_A = Variable(batch["A"].type(HalfTensor))
         real_B = Variable(batch["B"].type(HalfTensor))
-        B1 = Variable(batch["B1"].type(HalfTensor))
-        B2 = Variable(batch["B2"].type(HalfTensor))
-        B3 = Variable(batch["B3"].type(HalfTensor))
-        B4 = Variable(batch["B4"].type(HalfTensor))
-        TB = Variable(batch["T_B"].type(HalfTensor))
+        
+        # Crop real_B patches into 16
+        B1, B2, B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16 = make_16_patches(real_B)
 
         # Adversarial ground truths: global image
         valid_ones = Variable(HalfTensor(np.ones((real_A.size(0), *patch_for_g))), requires_grad=False)
@@ -452,56 +387,46 @@ for epoch in range(opt.epoch, opt.n_epochs):
 
         with autocast(): 
             fake_B = generator(real_A)
-
             # Adverarial - How fake and how real
             # relativistic loss
             pred_fake = discriminator1(fake_B, real_A)
             real_pred = discriminator1(real_B, real_A)
             loss_GAN_g = criterion_GAN(pred_fake - real_pred.detach(), valid)
-      
+
             # Triplet - Structural integrity 
             # triplet loss on the patches of fake_B
-            fake_B1 = fake_B[:, :, 0:0+opt.img_width//2, 0:0+opt.img_height//2] #(x,y) = (0,0)
-            fake_B2 = fake_B[:, :, 0:0+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (0, 128)
-            fake_B3 = fake_B[:, :, 128:128+opt.img_width//2, 0:0+opt.img_height//2] #(x,y)=(128,0)
-            fake_B4 = fake_B[:, :, 128:128+opt.img_width//2, 128:128+opt.img_height//2] #(x,y) = (128,128)
-            
+            fake_B1, fake_B2, fake_B3, fake_B4,fake_B5,fake_B6, fake_B7, fake_B8, fake_B9, fake_B10, fake_B11, fake_B12, fake_B13, fake_B14, fake_B15, fake_B16 = make_16_patches(fake_B)
+
+            # TO DO - CAN ABSTRACT THIS OUT MORE - Write a function
             # Here I randomize the negatives
-            random_patches = torch.stack([B1, B2, B3, B4])
-            patch_num = 4
+            random_patches = torch.stack([B1, B2, B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16])
+            patch_num = 16
             # randomize the negatives
             B1_trip_loss = triplet_loss(fake_B1, B1, random_patches[np.random.randint(patch_num, size=1).item()])
             B2_trip_loss = triplet_loss(fake_B2, B2, random_patches[np.random.randint(patch_num, size=1).item()])
             B3_trip_loss = triplet_loss(fake_B3, B3, random_patches[np.random.randint(patch_num, size=1).item()])
             B4_trip_loss = triplet_loss(fake_B4, B4, random_patches[np.random.randint(patch_num, size=1).item()])
-            loss_triplet_patch = 0.25*(B1_trip_loss + B2_trip_loss + B3_trip_loss + B4_trip_loss)
-            
-            # Temperature loss using Triplet Loss
-            # fake_B temps
-            TFB_ = vectorize_temps(fake_B)
-            
-            # data augmented B temps, serves as negatives
-            transform_jit = transforms.ColorJitter(brightness=0.5, contrast=0.75, saturation=1.5, hue=0.5)
-            B_tf = transform_jit(real_B)
-            TBTF = vectorize_temps(B_tf)
-            TB = TB.reshape(TB.size(0), 1, TB.size(1), TB.size(2))
-            
-            loss_temp_g = criterion_temp(TFB_, TB, TBTF)*lambda_t
-            
+            B5_trip_loss = triplet_loss(fake_B5, B5, random_patches[np.random.randint(patch_num, size=1).item()])
+            B6_trip_loss = triplet_loss(fake_B6, B6, random_patches[np.random.randint(patch_num, size=1).item()])
+            B7_trip_loss = triplet_loss(fake_B7, B7, random_patches[np.random.randint(patch_num, size=1).item()])
+            B8_trip_loss = triplet_loss(fake_B8, B8, random_patches[np.random.randint(patch_num, size=1).item()])
+            B9_trip_loss = triplet_loss(fake_B9, B9, random_patches[np.random.randint(patch_num, size=1).item()])
+            B10_trip_loss = triplet_loss(fake_B10, B10, random_patches[np.random.randint(patch_num, size=1).item()])
+            B11_trip_loss = triplet_loss(fake_B11, B11, random_patches[np.random.randint(patch_num, size=1).item()])
+            B12_trip_loss = triplet_loss(fake_B12, B12, random_patches[np.random.randint(patch_num, size=1).item()])
+            B13_trip_loss = triplet_loss(fake_B13, B13, random_patches[np.random.randint(patch_num, size=1).item()])
+            B14_trip_loss = triplet_loss(fake_B14, B14, random_patches[np.random.randint(patch_num, size=1).item()])
+            B15_trip_loss = triplet_loss(fake_B15, B15, random_patches[np.random.randint(patch_num, size=1).item()])
+            B16_trip_loss = triplet_loss(fake_B16, B16, random_patches[np.random.randint(patch_num, size=1).item()])
+           
+            loss_triplet_patch = 1/16*(B1_trip_loss + B2_trip_loss + B3_trip_loss + B4_trip_loss + B5_trip_loss + B6_trip_loss + B7_trip_loss + B8_trip_loss +
+                                      B9_trip_loss + B10_trip_loss + B11_trip_loss + B12_trip_loss + B13_trip_loss + B14_trip_loss + B15_trip_loss + B16_trip_loss)
+
             # LPIPS loss - perceptual similarity
             loss_pix_g = criterion_lpips(fake_B, real_B)
-            
-            # Fourier Transform Loss
-            Amp_f, Pha_f = fft_components(fake_B) # will pass a batch in
-            Amp_r, Pha_r = fft_components(real_B)
-            loss_Amp = criterion_amp(Amp_f, Amp_r)
-            loss_Pha = criterion_phase(Pha_f, Pha_r)
-            loss_FFT = 1/2*(loss_Amp + loss_Pha)
-            
+
             # Total Generator Loss
-            # GAN G: 0.696318 | pix_G: 51.789307 | trip_G: 1.382264 | temp_G: 147.511887 | fft: 2612.587891
-            
-            loss_G = 0.5*loss_GAN_g + 0.5*loss_pix_g + loss_triplet_patch + 0.5*loss_temp_g + 1/100*loss_FFT
+            loss_G = loss_GAN_g + loss_pix_g + loss_triplet_patch
 
         scaler.scale(loss_G).backward()
         scaler.step(optimizer_G)
@@ -544,7 +469,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
 
         # Print log
         sys.stdout.write(
-            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | patch: %f | temp_G: %f | fft: %f] ETA: %s"
+            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | trip_G: %f ] ETA: %s"
             % (
                 opt.experiment, 
                 epoch, #%d
@@ -556,14 +481,12 @@ for epoch in range(opt.epoch, opt.n_epochs):
                 loss_GAN_g.item(),
                 loss_pix_g.item(),
                 loss_triplet_patch.item(),
-                loss_temp_g.item(),
-                loss_FFT.item(),
                 time_left, #%s
             )
         )
 
         f.write(
-            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | patch: %f | temp_G: %f | fft: %f] ETA: %s"
+            "\r |Experiment: %s| [Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f | GAN G: %f | pix_G: %f | trip_G: %f ] ETA: %s"
             % (
                 opt.experiment, 
                 epoch, #%d
@@ -575,8 +498,6 @@ for epoch in range(opt.epoch, opt.n_epochs):
                 loss_GAN_g.item(),
                 loss_pix_g.item(),
                 loss_triplet_patch.item(),
-                loss_temp_g.item(),
-                loss_FFT.item(),
                 time_left, #%s
             )
         )
