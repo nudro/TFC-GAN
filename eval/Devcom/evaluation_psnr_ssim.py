@@ -8,7 +8,9 @@ from os import listdir,makedirs
 from os.path import isfile,join
 import cv2
 import os,glob
-from skimage.measure import compare_ssim
+#from skimage.measure import compare_ssim
+from skimage.metrics import structural_similarity
+# This function was renamed from skimage.measure.compare_ssim to skimage.metrics.structural_similarity.
 import re
 import itertools
 
@@ -107,7 +109,6 @@ def convert_grayscale(real, fake):
     return reals, reals_image_names, real_digits_, fakes, fakes_image_names, fake_digits_
 
 # BELOW HAS DEVCOM-specifci TEST SET file names
-from skimage.metrics import structural_similarity
 # mssimfloat
 # RETURNS The mean structural similarity index over the image.
 
@@ -154,7 +155,7 @@ def main(fake_dir, real_dir, experiment, test_set):
 
     psnr_values, psnr_table = psnr(master)
     psnr_table = pd.concat([psnr_table, b], axis=1)
-    psnr_table.to_csv('/Users/catherine/Documents/GANs_Research/my_imps/research_models/faPVTgan/evaluation/Devcom/%s/psnr.csv' % (experiment))
+    psnr_table.to_csv('/Users/catherine/Documents/GANs_Research/my_imps/research_models/TFCGAN_CVPR/evaluation/Devcom/%s/psnr.csv' % (experiment))
 
     # SSIM metrics
     reals, reals_image_names, real_digits_, fakes, fakes_image_names, fake_digits_ = convert_grayscale(real_dir, fake_dir)
@@ -165,7 +166,7 @@ def main(fake_dir, real_dir, experiment, test_set):
     merged = f_df.merge(r_df, on=0)
     master = merged.values.tolist()
     ssim_table = ssim(master)
-    ssim_table.to_csv('/Users/catherine/Documents/GANs_Research/my_imps/research_models/faPVTgan/evaluation/Devcom/%s/ssim.csv' % (experiment))
+    ssim_table.to_csv('/Users/catherine/Documents/GANs_Research/my_imps/research_models/TFCGAN_CVPR/evaluation/Devcom/%s/ssim.csv' % (experiment))
 
 
 ### MAIN ###

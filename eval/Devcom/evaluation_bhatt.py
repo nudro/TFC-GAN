@@ -94,7 +94,7 @@ def main(fake_dir, real_dir, experiment, test_set):
     # Bhattacharyya metrics
     bhatt_values, bhatt_table = bhatt(master)
     bhatt_table = pd.concat([bhatt_table, b], axis=1)
-    bhatt_table.to_csv('/Users/catherine/Documents/GANs_Research/my_imps/research_models/faPVTgan/evaluation/Devcom/%s/bhatt.csv' % (experiment))
+    bhatt_table.to_csv('/Users/catherine/Documents/GANs_Research/my_imps/research_models/TFCGAN_CVPR/evaluation/Devcom/%s/bhatt.csv' % (experiment))
 
 
 ### MAIN ###
