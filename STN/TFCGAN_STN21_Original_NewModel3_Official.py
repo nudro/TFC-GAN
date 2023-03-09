@@ -33,8 +33,7 @@ from medpy.filter.smoothing import anisotropic_diffusion
 
 
 """
-
-VERY WEIRD EXPERIMENT. Trying to force the warped_B to get closer to the geometry of fake_A. 
+# was previously called 'refine3' <- this is the new, competitive model
 
 fake_B = G1(A)
 fake_A = G2(B)
@@ -534,11 +533,11 @@ if cuda:
     
 # 2 GPUs on Server 039
 # !!!!! I HAD TO CHANGE THE ORDER FROM 1,0 FOR THE IRIS DATASET, PUT BACK 
-generator1 = torch.nn.DataParallel(generator1, device_ids=[1,0])
-generator2 = torch.nn.DataParallel(generator2, device_ids=[1,0])
-discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[1,0])
-discriminator2 = torch.nn.DataParallel(discriminator2, device_ids=[1,0])
-model = torch.nn.DataParallel(model, device_ids=[1,0])  
+generator1 = torch.nn.DataParallel(generator1, device_ids=[0,1])
+generator2 = torch.nn.DataParallel(generator2, device_ids=[0,1])
+discriminator1 = torch.nn.DataParallel(discriminator1, device_ids=[0,1])
+discriminator2 = torch.nn.DataParallel(discriminator2, device_ids=[0,1])
+model = torch.nn.DataParallel(model, device_ids=[0,1])  
 
 
 if opt.epoch != 0:
